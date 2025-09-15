@@ -49,14 +49,50 @@ class VeeamDataIntegrationAPI:
             bool: True if authentication successful, False otherwise
         """
         try:
+            # Use the correct Veeam OAuth2 endpoint with API version header
             auth_url = f"{self.base_url}/api/oauth2/token"
             auth_data = {
                 'grant_type': 'password',
                 'username': self.username,
-                'password': self.password
+                'password': self.password,
+                'refresh_token': '',
+                'code': '',
+                'use_short_term_refresh': '',
+                'vbr_token': ''
             }
             
-            response = self.session.post(auth_url, data=auth_data)
+            # Set the correct headers for Veeam API
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            logger.info(f"Attempting authentication to: {auth_url}")
+            response = self.session.post(auth_url, data=auth_data, headers=headers)
+            
+            # Log response details for debugging
+            logger.info(f"Auth response status: {response.status_code}")
+            logger.info(f"Auth response headers: {dict(response.headers)}")
+            
+            if response.status_code == 400:
+                try:
+                    error_data = response.json()
+                    logger.error(f"Authentication failed - Bad Request: {error_data}")
+                    raise VeeamAPIError(f"Authentication failed: {error_data.get('error_description', 'Invalid credentials')}")
+                except json.JSONDecodeError:
+                    logger.error(f"Authentication failed - Bad Request (non-JSON): {response.text}")
+                    raise VeeamAPIError(f"Authentication failed: Invalid credentials or server configuration")
+            elif response.status_code == 401:
+                logger.error("Authentication failed - Unauthorized")
+                raise VeeamAPIError("Authentication failed: Invalid username or password")
+            elif response.status_code == 403:
+                logger.error("Authentication failed - Forbidden")
+                raise VeeamAPIError("Authentication failed: Access denied - check user permissions")
+            elif response.status_code == 404:
+                logger.error("Authentication endpoint not found")
+                raise VeeamAPIError("Authentication failed: OAuth2 endpoint not found - check server URL")
+            
             response.raise_for_status()
             
             auth_result = response.json()
@@ -71,11 +107,17 @@ class VeeamDataIntegrationAPI:
                 return True
             else:
                 logger.error("Failed to obtain access token from Veeam API")
-                return False
+                raise VeeamAPIError("Authentication failed: No access token received")
                 
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Connection failed: {str(e)}")
+            raise VeeamAPIError(f"Connection failed: Cannot reach Veeam server at {self.base_url}")
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Request timeout: {str(e)}")
+            raise VeeamAPIError("Authentication failed: Request timeout")
         except requests.exceptions.RequestException as e:
             logger.error(f"Authentication failed: {str(e)}")
-            return False
+            raise VeeamAPIError(f"Authentication failed: {str(e)}")
     
     def get_backups(self, vm_name: Optional[str] = None, 
                    start_date: Optional[datetime] = None,
@@ -92,8 +134,15 @@ class VeeamDataIntegrationAPI:
             List of backup information dictionaries
         """
         try:
-            url = f"{self.base_url}/api/v1/backups"
+            url = f"{self.base_url}/api/backups"
             params = {}
+            
+            # Set the correct headers for Veeam API
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
             
             if vm_name:
                 params['vmName'] = vm_name
@@ -102,7 +151,7 @@ class VeeamDataIntegrationAPI:
             if end_date:
                 params['endDate'] = end_date.isoformat()
             
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, headers=headers)
             response.raise_for_status()
             
             backups = response.json()
@@ -128,13 +177,21 @@ class VeeamDataIntegrationAPI:
             # Ensure mount point directory exists
             os.makedirs(mount_point, exist_ok=True)
             
-            url = f"{self.base_url}/api/v1/backups/{backup_id}/mount"
+            url = f"{self.base_url}/api/backups/{backup_id}/mount"
             mount_data = {
                 'mountPoint': mount_point,
                 'readOnly': True  # Mount as read-only for safety
             }
             
-            response = self.session.post(url, json=mount_data)
+            # Set the correct headers for Veeam API
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            response = self.session.post(url, json=mount_data, headers=headers)
             response.raise_for_status()
             
             mount_session = response.json()
@@ -166,8 +223,16 @@ class VeeamDataIntegrationAPI:
             bool: True if unmount successful, False otherwise
         """
         try:
-            url = f"{self.base_url}/api/v1/mount-sessions/{session_id}"
-            response = self.session.delete(url)
+            url = f"{self.base_url}/api/mount-sessions/{session_id}"
+            
+            # Set the correct headers for Veeam API
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.delete(url, headers=headers)
             response.raise_for_status()
             
             if session_id in self.mount_sessions:
@@ -191,7 +256,7 @@ class VeeamDataIntegrationAPI:
             Dictionary containing mount session status
         """
         try:
-            url = f"{self.base_url}/api/v1/mount-sessions/{session_id}"
+            url = f"{self.base_url}/api/v1.2-rev0/mount-sessions/{session_id}"
             response = self.session.get(url)
             response.raise_for_status()
             

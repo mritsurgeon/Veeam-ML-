@@ -40,13 +40,17 @@ def configure_veeam_connection():
         )
         
         # Test authentication
-        if veeam_api.authenticate():
-            return jsonify({
-                'message': 'Veeam API connection configured successfully',
-                'status': 'connected'
-            })
-        else:
-            return jsonify({'error': 'Failed to authenticate with Veeam API'}), 401
+        try:
+            if veeam_api.authenticate():
+                return jsonify({
+                    'message': 'Veeam API connection configured successfully',
+                    'status': 'connected'
+                })
+            else:
+                return jsonify({'error': 'Failed to authenticate with Veeam API'}), 401
+        except VeeamAPIError as e:
+            logger.error(f"Veeam API authentication error: {str(e)}")
+            return jsonify({'error': str(e)}), 401
             
     except Exception as e:
         logger.error(f"Failed to configure Veeam connection: {str(e)}")
