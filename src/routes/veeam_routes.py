@@ -114,6 +114,30 @@ def list_backups():
         logger.error(f"Failed to list backups: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@veeam_bp.route('/mount-sessions', methods=['GET'])
+def get_mount_sessions():
+    """Get all active mount sessions."""
+    global veeam_api
+    
+    if veeam_api is None:
+        return jsonify({'error': 'Veeam API not configured'}), 400
+    
+    try:
+        # Get mount sessions from Veeam API
+        sessions = veeam_api.get_mount_sessions()
+        
+        return jsonify({
+            'mount_sessions': sessions,
+            'total_count': len(sessions)
+        })
+        
+    except VeeamAPIError as e:
+        logger.error(f"Veeam API error: {str(e)}")
+        return jsonify({'error': f'Veeam API error: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Failed to get mount sessions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @veeam_bp.route('/backups/<int:backup_id>/mount', methods=['POST'])
 def mount_backup(backup_id):
     """Mount a Veeam backup as a file system."""

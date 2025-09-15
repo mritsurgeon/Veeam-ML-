@@ -164,7 +164,7 @@ class VeeamDataIntegrationAPI:
     
     def mount_backup(self, backup_id: str, mount_point: str) -> Dict[str, Any]:
         """
-        Mount a backup as a file system.
+        Mount a backup as a file system using Veeam File Level Restore (FLR).
         
         Args:
             backup_id: ID of the backup to mount
@@ -177,8 +177,10 @@ class VeeamDataIntegrationAPI:
             # Ensure mount point directory exists
             os.makedirs(mount_point, exist_ok=True)
             
-            url = f"{self.base_url}/api/backups/{backup_id}/mount"
+            # Use Veeam File Level Restore API
+            url = f"{self.base_url}/api/v1/restore/flr"
             mount_data = {
+                'backupId': backup_id,
                 'mountPoint': mount_point,
                 'readOnly': True  # Mount as read-only for safety
             }
@@ -212,6 +214,34 @@ class VeeamDataIntegrationAPI:
             logger.error(f"Failed to mount backup {backup_id}: {str(e)}")
             raise VeeamAPIError(f"Failed to mount backup {backup_id}: {str(e)}")
     
+    def get_mount_sessions(self) -> List[Dict[str, Any]]:
+        """
+        Get all active File Level Restore mount sessions.
+        
+        Returns:
+            List of mount session information dictionaries
+        """
+        try:
+            url = f"{self.base_url}/api/v1/backupBrowser/flr"
+            
+            # Set the correct headers for Veeam API
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            
+            sessions = response.json()
+            logger.info(f"Retrieved {len(sessions)} active FLR sessions")
+            return sessions
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to retrieve mount sessions: {str(e)}")
+            raise VeeamAPIError(f"Failed to retrieve mount sessions: {str(e)}")
+    
     def unmount_backup(self, session_id: str) -> bool:
         """
         Unmount a previously mounted backup.
@@ -223,7 +253,8 @@ class VeeamDataIntegrationAPI:
             bool: True if unmount successful, False otherwise
         """
         try:
-            url = f"{self.base_url}/api/mount-sessions/{session_id}"
+            # Use Veeam File Level Restore unmount API
+            url = f"{self.base_url}/api/v1/restore/flr/{session_id}/unmount"
             
             # Set the correct headers for Veeam API
             headers = {
@@ -232,7 +263,7 @@ class VeeamDataIntegrationAPI:
                 'Authorization': f'Bearer {self.auth_token}'
             }
             
-            response = self.session.delete(url, headers=headers)
+            response = self.session.post(url, headers=headers)
             response.raise_for_status()
             
             if session_id in self.mount_sessions:
