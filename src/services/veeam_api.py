@@ -134,7 +134,7 @@ class VeeamDataIntegrationAPI:
             List of backup information dictionaries
         """
         try:
-            url = f"{self.base_url}/api/backups"
+            url = f"{self.base_url}/api/v1/backups"
             params = {}
             
             # Set the correct headers for Veeam API
@@ -154,8 +154,20 @@ class VeeamDataIntegrationAPI:
             response = self.session.get(url, params=params, headers=headers)
             response.raise_for_status()
             
-            backups = response.json()
-            logger.info(f"Retrieved {len(backups)} backups from Veeam API")
+            backups_response = response.json()
+            
+            # Handle Veeam API response format - it might be wrapped in a data structure
+            if isinstance(backups_response, dict):
+                if 'data' in backups_response:
+                    backups = backups_response['data']
+                elif 'backups' in backups_response:
+                    backups = backups_response['backups']
+                else:
+                    backups = backups_response
+            else:
+                backups = backups_response
+            
+            logger.info(f"Retrieved {len(backups) if isinstance(backups, list) else 'unknown'} backups from Veeam API")
             return backups
             
         except requests.exceptions.RequestException as e:
