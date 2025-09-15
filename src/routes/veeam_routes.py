@@ -74,27 +74,61 @@ def list_backups():
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
         
-        # Fetch backups from Veeam API
-        backups = veeam_api.get_backups(vm_name=vm_name, start_date=start_dt, end_date=end_dt)
+        # Get backup objects first
+        backup_objects_url = f"{veeam_api.base_url}/api/v1/backupObjects"
+        headers = {
+            'accept': 'application/json',
+            'x-api-version': '1.2-rev0',
+            'Authorization': f'Bearer {veeam_api.auth_token}'
+        }
         
-        # Store/update backups in database
-        for backup_info in backups:
-            existing_backup = VeeamBackup.query.filter_by(backup_id=backup_info['id']).first()
+        response = veeam_api.session.get(backup_objects_url, headers=headers)
+        if response.status_code != 200:
+            return jsonify({'error': f'Failed to get backup objects: {response.text}'}), 500
+            
+        backup_objects_response = response.json()
+        backup_objects = backup_objects_response.get('data', [])
+        
+        # Get restore points for each backup object
+        all_restore_points = []
+        for backup_obj in backup_objects:
+            try:
+                # Get restore points for this backup object
+                restore_points_url = f"{veeam_api.base_url}/api/v1/backupObjects/{backup_obj['id']}/restorePoints"
+                response = veeam_api.session.get(restore_points_url, headers=headers)
+                
+                if response.status_code == 200:
+                    restore_points_response = response.json()
+                    restore_points = restore_points_response.get('data', [])
+                    
+                    # Add restore points with backup object info
+                    for rp in restore_points:
+                        rp['backup_object_name'] = backup_obj.get('name', 'Unknown')
+                        rp['backup_object_id'] = backup_obj['id']
+                        all_restore_points.append(rp)
+                        
+            except Exception as e:
+                logger.error(f"Failed to get restore points for {backup_obj['id']}: {str(e)}")
+                continue
+        
+        # Store/update restore points in database (treating them as "backups")
+        for restore_point in all_restore_points:
+            existing_backup = VeeamBackup.query.filter_by(backup_id=restore_point['id']).first()
             
             if existing_backup:
                 # Update existing backup
-                existing_backup.backup_name = backup_info.get('name', existing_backup.backup_name)
-                existing_backup.backup_path = backup_info.get('path', existing_backup.backup_path)
-                existing_backup.backup_size = backup_info.get('size', existing_backup.backup_size)
+                existing_backup.backup_name = f"{restore_point.get('backup_object_name', 'Unknown')} - {restore_point.get('name', 'Unknown')}"
+                existing_backup.backup_path = restore_point.get('backupFileId', existing_backup.backup_path)
+                existing_backup.backup_size = 0  # Restore points don't have size info
                 existing_backup.updated_at = datetime.utcnow()
             else:
-                # Create new backup record
+                # Create new backup record (actually a restore point)
                 new_backup = VeeamBackup(
-                    backup_id=backup_info['id'],
-                    backup_name=backup_info.get('name', 'Unknown'),
-                    backup_path=backup_info.get('path', ''),
-                    backup_date=datetime.fromisoformat(backup_info['created_date']) if 'created_date' in backup_info else datetime.utcnow(),
-                    backup_size=backup_info.get('size', 0)
+                    backup_id=restore_point['id'],  # This is the restore point ID we need for mounting
+                    backup_name=f"{restore_point.get('backup_object_name', 'Unknown')} - {restore_point.get('name', 'Unknown')}",
+                    backup_path=restore_point.get('backupFileId', ''),
+                    backup_date=datetime.fromisoformat(restore_point['creationTime'].replace('Z', '+00:00')) if 'creationTime' in restore_point else datetime.utcnow(),
+                    backup_size=0
                 )
                 db.session.add(new_backup)
         

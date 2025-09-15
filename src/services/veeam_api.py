@@ -198,7 +198,7 @@ class VeeamDataIntegrationAPI:
             mount_data = {
                 'restorePointId': restore_point_id,
                 'type': 'ISCSITarget',  # Use iSCSI target (simpler, no credentials needed)
-                'allowedIps': ['127.0.0.1', 'localhost']  # Allow localhost access
+                'allowedIps': ['127.0.0.1']  # Allow localhost access
             }
             
             # Set the correct headers for Veeam API
