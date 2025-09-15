@@ -114,28 +114,33 @@ def list_backups():
         logger.error(f"Failed to list backups: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-@veeam_bp.route('/mount-sessions', methods=['GET'])
-def get_mount_sessions():
-    """Get all active mount sessions."""
+@veeam_bp.route('/debug/credentials', methods=['GET'])
+def debug_credentials():
+    """Debug endpoint to see what credentials are available."""
     global veeam_api
     
     if veeam_api is None:
         return jsonify({'error': 'Veeam API not configured'}), 400
     
     try:
-        # Get mount sessions from Veeam API
-        sessions = veeam_api.get_mount_sessions()
+        # Get credentials directly
+        credentials_url = f"{veeam_api.base_url}/api/v1/credentials"
+        headers = {
+            'accept': 'application/json',
+            'x-api-version': '1.2-rev0',
+            'Authorization': f'Bearer {veeam_api.auth_token}'
+        }
+        
+        response = veeam_api.session.get(credentials_url, headers=headers)
+        response.raise_for_status()
+        credentials_response = response.json()
         
         return jsonify({
-            'mount_sessions': sessions,
-            'total_count': len(sessions)
+            'credentials': credentials_response
         })
         
-    except VeeamAPIError as e:
-        logger.error(f"Veeam API error: {str(e)}")
-        return jsonify({'error': f'Veeam API error: {str(e)}'}), 500
     except Exception as e:
-        logger.error(f"Failed to get mount sessions: {str(e)}")
+        logger.error(f"Failed to get credentials: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @veeam_bp.route('/backups/<int:backup_id>/mount', methods=['POST'])

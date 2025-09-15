@@ -176,10 +176,10 @@ class VeeamDataIntegrationAPI:
     
     def mount_backup(self, backup_id: str, mount_point: str) -> Dict[str, Any]:
         """
-        Mount a backup as a file system using Veeam File Level Restore (FLR).
+        Mount a backup using Veeam Data Integration API (Disk Publishing).
         
         Args:
-            backup_id: ID of the backup to mount
+            backup_id: ID of the backup to mount (this is actually a restore point ID)
             mount_point: Local directory path where backup will be mounted
             
         Returns:
@@ -189,74 +189,16 @@ class VeeamDataIntegrationAPI:
             # Ensure mount point directory exists
             os.makedirs(mount_point, exist_ok=True)
             
-            # First, get backup objects to find the correct object ID
-            backup_objects_url = f"{self.base_url}/api/v1/backupObjects"
-            headers = {
-                'accept': 'application/json',
-                'x-api-version': '1.2-rev0',
-                'Authorization': f'Bearer {self.auth_token}'
-            }
+            # The backup_id we receive is actually a restore point ID from our database
+            # We can use it directly for the Data Integration API
+            restore_point_id = backup_id
             
-            # Get backup objects
-            response = self.session.get(backup_objects_url, headers=headers)
-            response.raise_for_status()
-            backup_objects_response = response.json()
-            
-            # Handle response format - might be wrapped in data structure
-            if isinstance(backup_objects_response, dict):
-                if 'data' in backup_objects_response:
-                    backup_objects = backup_objects_response['data']
-                elif 'backupObjects' in backup_objects_response:
-                    backup_objects = backup_objects_response['backupObjects']
-                else:
-                    backup_objects = backup_objects_response
-            else:
-                backup_objects = backup_objects_response
-            
-            # Find the backup object that matches our backup_id
-            backup_object = None
-            for obj in backup_objects:
-                if isinstance(obj, dict) and (obj.get('id') == backup_id or obj.get('backupId') == backup_id):
-                    backup_object = obj
-                    break
-            
-            if not backup_object:
-                raise VeeamAPIError(f"Backup object not found for backup ID: {backup_id}")
-            
-            # Get restore points for this backup object
-            restore_points_url = f"{self.base_url}/api/v1/backupObjects/{backup_object['id']}/restorePoints"
-            response = self.session.get(restore_points_url, headers=headers)
-            response.raise_for_status()
-            restore_points_response = response.json()
-            
-            # Handle response format - might be wrapped in data structure
-            if isinstance(restore_points_response, dict):
-                if 'data' in restore_points_response:
-                    restore_points = restore_points_response['data']
-                elif 'restorePoints' in restore_points_response:
-                    restore_points = restore_points_response['restorePoints']
-                else:
-                    restore_points = restore_points_response
-            else:
-                restore_points = restore_points_response
-            
-            if not restore_points:
-                raise VeeamAPIError(f"No restore points found for backup object: {backup_object['id']}")
-            
-            # Use the first (most recent) restore point
-            restore_point = restore_points[0]
-            restore_point_id = restore_point['id']
-            
-            # Now mount using the restore point ID
-            url = f"{self.base_url}/api/v1/restore/flr"
+            # Use Veeam Data Integration API for disk publishing
+            url = f"{self.base_url}/api/v1/dataIntegration/publish"
             mount_data = {
                 'restorePointId': restore_point_id,
-                'type': 'Windows',  # Default to Windows, could be made configurable
-                'autoUnmount': {
-                    'isEnabled': True,
-                    'noActivityPeriodInMinutes': 30
-                },
-                'reason': 'ML Data Analysis'
+                'type': 'ISCSITarget',  # Use iSCSI target (simpler, no credentials needed)
+                'allowedIps': ['127.0.0.1', 'localhost']  # Allow localhost access
             }
             
             # Set the correct headers for Veeam API
@@ -290,13 +232,13 @@ class VeeamDataIntegrationAPI:
     
     def get_mount_sessions(self) -> List[Dict[str, Any]]:
         """
-        Get all active File Level Restore mount sessions.
+        Get all active Data Integration mount sessions.
         
         Returns:
             List of mount session information dictionaries
         """
         try:
-            url = f"{self.base_url}/api/v1/backupBrowser/flr"
+            url = f"{self.base_url}/api/v1/dataIntegration"
             
             # Set the correct headers for Veeam API
             headers = {
@@ -327,8 +269,8 @@ class VeeamDataIntegrationAPI:
             bool: True if unmount successful, False otherwise
         """
         try:
-            # Use Veeam File Level Restore unmount API
-            url = f"{self.base_url}/api/v1/restore/flr/{session_id}/unmount"
+            # Use Veeam Data Integration API unpublish endpoint
+            url = f"{self.base_url}/api/v1/dataIntegration/{session_id}/unpublish"
             
             # Set the correct headers for Veeam API
             headers = {
