@@ -174,23 +174,19 @@ class VeeamDataIntegrationAPI:
             logger.error(f"Failed to retrieve backups: {str(e)}")
             raise VeeamAPIError(f"Failed to retrieve backups: {str(e)}")
     
-    def mount_backup(self, backup_id: str, mount_point: str) -> Dict[str, Any]:
+    def mount_backup(self, backup_id: str, mount_point: str = None) -> Dict[str, Any]:
         """
         Mount a backup using Veeam Data Integration API (Disk Publishing).
         
         Args:
             backup_id: ID of the backup to mount (this is actually a restore point ID)
-            mount_point: Local directory path where backup will be mounted
+            mount_point: Optional local directory path (not used for Data Integration API)
             
         Returns:
             Dictionary containing mount session information
         """
         try:
-            # Ensure mount point directory exists
-            os.makedirs(mount_point, exist_ok=True)
-            
             # The backup_id we receive is actually a restore point ID from our database
-            # We can use it directly for the Data Integration API
             restore_point_id = backup_id
             
             # Use Veeam Data Integration API for disk publishing
@@ -213,7 +209,7 @@ class VeeamDataIntegrationAPI:
             response.raise_for_status()
             
             mount_session = response.json()
-            session_id = mount_session.get('sessionId')
+            session_id = mount_session.get('id')  # Data Integration API uses 'id' not 'sessionId'
             
             if session_id:
                 self.mount_sessions[session_id] = {
@@ -222,7 +218,7 @@ class VeeamDataIntegrationAPI:
                     'mounted_at': datetime.utcnow(),
                     'session_info': mount_session
                 }
-                logger.info(f"Successfully mounted backup {backup_id} at {mount_point}")
+                logger.info(f"Successfully mounted backup {backup_id} with session {session_id}")
             
             return mount_session
             
@@ -250,13 +246,251 @@ class VeeamDataIntegrationAPI:
             response = self.session.get(url, headers=headers)
             response.raise_for_status()
             
-            sessions = response.json()
-            logger.info(f"Retrieved {len(sessions)} active FLR sessions")
+            response_data = response.json()
+            # Handle paginated response structure
+            if 'data' in response_data:
+                sessions = response_data['data']
+                logger.info(f"Retrieved {len(sessions)} active mount sessions (total: {response_data.get('pagination', {}).get('total', len(sessions))})")
+            else:
+                sessions = response_data
+                logger.info(f"Retrieved {len(sessions)} active mount sessions")
             return sessions
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to retrieve mount sessions: {str(e)}")
             raise VeeamAPIError(f"Failed to retrieve mount sessions: {str(e)}")
+    
+    def get_mount_session_details(self, session_id: str) -> Dict[str, Any]:
+        """
+        Get detailed information about a specific mount session.
+        
+        Args:
+            session_id: ID of the mount session
+            
+        Returns:
+            Dictionary containing detailed mount session information
+        """
+        try:
+            url = f"{self.base_url}/api/v1/dataIntegration/{session_id}"
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            
+            session_details = response.json()
+            logger.info(f"Retrieved details for mount session {session_id}")
+            return session_details
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to retrieve mount session details: {str(e)}")
+            raise VeeamAPIError(f"Failed to retrieve mount session details: {str(e)}")
+    
+    def create_flr_session(self, restore_point_id: str) -> Dict[str, Any]:
+        """
+        Create a File Level Restore session for file browsing.
+        
+        Args:
+            restore_point_id: ID of the restore point to browse
+            
+        Returns:
+            Dictionary containing FLR session information
+        """
+        try:
+            url = f"{self.base_url}/api/v1/restore/flr"
+            flr_data = {
+                'restorePointId': restore_point_id,
+                'type': 'Windows',
+                'autoUnmount': {
+                    'isEnabled': True,
+                    'noActivityPeriodInMinutes': 5  # Short timeout for scanning
+                },
+                'reason': 'File browsing for ML analysis'
+            }
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            response = self.session.post(url, json=flr_data, headers=headers)
+            response.raise_for_status()
+            
+            flr_session = response.json()
+            logger.info(f"Created FLR session {flr_session.get('id')} for file browsing")
+            return flr_session
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create FLR session: {str(e)}")
+            raise VeeamAPIError(f"Failed to create FLR session: {str(e)}")
+    
+    def browse_flr_files(self, session_id: str, directory_path: str = '/') -> List[Dict[str, Any]]:
+        """
+        Browse files in a FLR session.
+        
+        Args:
+            session_id: FLR session ID
+            directory_path: Directory path to browse
+            
+        Returns:
+            List of file information dictionaries
+        """
+        try:
+            url = f"{self.base_url}/api/v1/backupBrowser/flr/{session_id}/files"
+            params = {'path': directory_path}
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            
+            files_response = response.json()
+            files = files_response.get('data', [])
+            
+            logger.info(f"Found {len(files)} files in {directory_path}")
+            return files
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to browse FLR files: {str(e)}")
+            raise VeeamAPIError(f"Failed to browse FLR files: {str(e)}")
+    
+    def cleanup_flr_session(self, session_id: str) -> bool:
+        """
+        Clean up a FLR session.
+        
+        Args:
+            session_id: FLR session ID to clean up
+            
+        Returns:
+            bool: True if cleanup successful
+        """
+        try:
+            url = f"{self.base_url}/api/v1/restore/flr/{session_id}/unmount"
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.post(url, headers=headers)
+            response.raise_for_status()
+            
+            logger.info(f"Cleaned up FLR session {session_id}")
+            return True
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to cleanup FLR session {session_id}: {str(e)}")
+            return False
+    
+    def mount_windows_backup_flr(self, restore_point_id: str) -> Dict[str, Any]:
+        """
+        Mount a Windows backup using File Level Restore (FLR).
+        This creates a FLR session that mounts to C:\\VeeamFLR on the Veeam server.
+        
+        Args:
+            restore_point_id: ID of the restore point to mount
+            
+        Returns:
+            Dictionary containing FLR session information
+        """
+        try:
+            # Use FLR API for Windows backups
+            url = f"{self.base_url}/api/v1/restore/flr"
+            flr_data = {
+                'restorePointId': restore_point_id,
+                'type': 'Windows',
+                'autoUnmount': {
+                    'isEnabled': True,
+                    'noActivityPeriodInMinutes': 30  # Longer timeout for file access
+                },
+                'reason': 'File Level Restore for ML analysis'
+            }
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}',
+                'Content-Type': 'application/json'
+            }
+            
+            response = self.session.post(url, json=flr_data, headers=headers)
+            response.raise_for_status()
+            
+            flr_session = response.json()
+            session_id = flr_session.get('id')
+            
+            if session_id:
+                # Store FLR session info
+                self.mount_sessions[session_id] = {
+                    'backup_id': restore_point_id,
+                    'mount_point': f"C:\\VeeamFLR\\{restore_point_id}",  # Default Windows FLR path
+                    'mounted_at': datetime.utcnow(),
+                    'session_info': flr_session,
+                    'mount_type': 'FLR'
+                }
+                logger.info(f"Successfully created Windows FLR session {session_id}")
+            
+            return flr_session
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to create Windows FLR session: {str(e)}")
+            raise VeeamAPIError(f"Failed to create Windows FLR session: {str(e)}")
+    
+    def get_flr_mount_points(self, session_id: str) -> List[str]:
+        """
+        Get the actual mount points for a FLR session.
+        For Windows FLR, this returns paths like C:\\VeeamFLR\\{session_id}
+        
+        Args:
+            session_id: FLR session ID
+            
+        Returns:
+            List of mount point paths
+        """
+        try:
+            # Get FLR session details
+            url = f"{self.base_url}/api/v1/restore/flr/{session_id}"
+            
+            headers = {
+                'accept': 'application/json',
+                'x-api-version': '1.2-rev0',
+                'Authorization': f'Bearer {self.auth_token}'
+            }
+            
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            
+            session_details = response.json()
+            
+            # Extract mount points from FLR session
+            mount_points = []
+            if 'mountPoints' in session_details:
+                mount_points = session_details['mountPoints']
+            elif 'mountPoint' in session_details:
+                mount_points = [session_details['mountPoint']]
+            
+            # If no mount points in response, use default Windows FLR path
+            if not mount_points:
+                mount_points = [f"C:\\VeeamFLR\\{session_id}"]
+            
+            logger.info(f"FLR session {session_id} mount points: {mount_points}")
+            return mount_points
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get FLR mount points: {str(e)}")
+            # Return default path if we can't get details
+            return [f"C:\\VeeamFLR\\{session_id}"]
     
     def unmount_backup(self, session_id: str) -> bool:
         """

@@ -222,8 +222,10 @@ export const BackupManager = () => {
                           {formatDate(backup.backup_date)}
                         </div>
                         <div className="flex items-center">
-                          <HardDrive className="h-4 w-4 mr-1" />
-                          {formatFileSize(backup.backup_size)}
+                          <Activity className="h-4 w-4 mr-1" />
+                          <Badge variant="outline" className="text-xs">
+                            {backup.os_type || 'Unknown'}
+                          </Badge>
                         </div>
                       </div>
                     </div>

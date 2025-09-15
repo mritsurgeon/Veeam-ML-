@@ -15,6 +15,7 @@ class VeeamBackup(db.Model):
     backup_date = db.Column(db.DateTime, nullable=False)
     backup_size = db.Column(db.BigInteger, nullable=True)
     status = db.Column(db.String(50), default='available')  # available, mounted, processing, error
+    os_type = db.Column(db.String(50), default='unknown')  # windows, linux, unknown
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -31,6 +32,7 @@ class VeeamBackup(db.Model):
             'backup_date': self.backup_date.isoformat() if self.backup_date else None,
             'backup_size': self.backup_size,
             'status': self.status,
+            'os_type': self.os_type,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
