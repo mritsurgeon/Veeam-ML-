@@ -16,7 +16,8 @@ import {
   Activity,
   Database,
   Brain,
-  BarChart3
+  BarChart3,
+  HardDrive
 } from 'lucide-react'
 
 export const ConfigurationPanel = () => {
@@ -24,7 +25,12 @@ export const ConfigurationPanel = () => {
     base_url: '',
     username: '',
     password: '',
-    verify_ssl: true
+    verify_ssl: true,
+    mount_server_name: '',
+    mount_server_username: '',
+    mount_server_password: '',
+    mount_host_id: '',
+    reuse_api_credentials: true
   })
   const [isConnecting, setIsConnecting] = useState(false)
   const [healthStatus, setHealthStatus] = useState(null)
@@ -214,6 +220,88 @@ export const ConfigurationPanel = () => {
               </Button>
             )}
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Mount Server Configuration */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center space-x-2">
+            <HardDrive className="h-5 w-5" />
+            <span>Mount Server Configuration</span>
+          </CardTitle>
+          <CardDescription>
+            Configure the mount server settings for iSCSI disk publishing
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="mount_server_name">Mount Server Name/IP</Label>
+              <Input
+                id="mount_server_name"
+                type="text"
+                placeholder="172.21.234.6"
+                value={config.mount_server_name}
+                onChange={(e) => setConfig({...config, mount_server_name: e.target.value})}
+              />
+              <p className="text-sm text-gray-500 mt-1">
+                DNS name or IP address of the target server for iSCSI mounting
+              </p>
+            </div>
+            
+            <div>
+              <Label htmlFor="mount_host_id">Mount Host ID (Optional)</Label>
+              <Input
+                id="mount_host_id"
+                type="text"
+                placeholder="00000000-0000-0000-0000-000000000000"
+                value={config.mount_host_id}
+                onChange={(e) => setConfig({...config, mount_host_id: e.target.value})}
+              />
+              <p className="text-sm text-gray-500 mt-1">
+                Mount server ID (leave empty to use default)
+              </p>
+            </div>
+          </div>
+          
+          <div className="flex items-center space-x-2">
+            <Switch
+              id="reuse_api_credentials"
+              checked={config.reuse_api_credentials}
+              onCheckedChange={(checked) => setConfig({...config, reuse_api_credentials: checked})}
+            />
+            <Label htmlFor="reuse_api_credentials" className="flex items-center space-x-2">
+              <Shield className="h-4 w-4" />
+              <span>Reuse API connection credentials for mount server</span>
+            </Label>
+          </div>
+          
+          {!config.reuse_api_credentials && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="mount_server_username">Mount Server Username</Label>
+                <Input
+                  id="mount_server_username"
+                  type="text"
+                  placeholder="mount-username"
+                  value={config.mount_server_username}
+                  onChange={(e) => setConfig({...config, mount_server_username: e.target.value})}
+                />
+              </div>
+              
+              <div>
+                <Label htmlFor="mount_server_password">Mount Server Password</Label>
+                <Input
+                  id="mount_server_password"
+                  type="password"
+                  placeholder="••••••••"
+                  value={config.mount_server_password}
+                  onChange={(e) => setConfig({...config, mount_server_password: e.target.value})}
+                />
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 

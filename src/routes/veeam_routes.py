@@ -32,12 +32,16 @@ def configure_veeam_connection():
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
         
-        # Initialize Veeam API client
+        # Initialize Veeam API client with mount server configuration
         veeam_api = VeeamDataIntegrationAPI(
             base_url=data['base_url'],
             username=data['username'],
             password=data['password'],
-            verify_ssl=data.get('verify_ssl', True)
+            verify_ssl=data.get('verify_ssl', True),
+            mount_server_name=data.get('mount_server_name'),
+            mount_server_username=data.get('mount_server_username'),
+            mount_server_password=data.get('mount_server_password'),
+            mount_host_id=data.get('mount_host_id')
         )
         
         # Test authentication

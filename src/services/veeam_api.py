@@ -22,7 +22,9 @@ class VeeamDataIntegrationAPI:
     Handles backup mounting, unmounting, and data access operations.
     """
     
-    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = False):
+    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = False,
+             mount_server_name: str = None, mount_server_username: str = None, 
+             mount_server_password: str = None, mount_host_id: str = None):
         """
         Initialize the Veeam API client.
         
@@ -31,11 +33,19 @@ class VeeamDataIntegrationAPI:
             username: Username for authentication
             password: Password for authentication
             verify_ssl: Whether to verify SSL certificates
+            mount_server_name: DNS name or IP address of the mount server (for iSCSI)
+            mount_server_username: Username for mount server (optional, defaults to main username)
+            mount_server_password: Password for mount server (optional, defaults to main password)
+            mount_host_id: Mount server ID (optional)
         """
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
         self.verify_ssl = verify_ssl
+        self.mount_server_name = mount_server_name or base_url.split('://')[1].split(':')[0]  # Extract host from base_url
+        self.mount_server_username = mount_server_username or username
+        self.mount_server_password = mount_server_password or password
+        self.mount_host_id = mount_host_id
         self.session = requests.Session()
         self.session.verify = verify_ssl
         self.auth_token = None
@@ -232,47 +242,58 @@ class VeeamDataIntegrationAPI:
             Dictionary containing mount session information
         """
         try:
-            # First, check if there's already an active FLR session for this backup
+            # First, check if there's already an active session for this backup in Veeam
             active_sessions = self.get_active_sessions()
             existing_session = None
             
             for session in active_sessions:
                 if (session.get('backupId') == backup_id and 
-                    session.get('mount_type') == 'FLR' and 
                     session.get('state') == 'Working'):
                     existing_session = session
-                    logger.info(f"Found existing FLR session {session['id']} for backup {backup_id}")
+                    logger.info(f"Found existing session {session['id']} for backup {backup_id}")
                     break
             
             if existing_session:
-                # Use existing FLR session
+                # Use existing session and resolve actual folder name from Veeam
                 session_id = existing_session['id']
-                flr_session = existing_session
+                session_info = existing_session
                 
-                # Construct the actual folder name used by Veeam
-                # Format: {machineName}_{first8CharsOfSessionId}
-                machine_name = flr_session.get('sourceProperties', {}).get('machineName', 'unknown')
-                abbreviated_id = session_id[:8]
-                folder_name = f"{machine_name}_{abbreviated_id}"
+                # Prefer Data Integration mount details, fallback to session logs, then fallback to abbreviated id
+                folder_name = None
+                try:
+                    folder_name = self._get_folder_name_from_data_integration(session_id)
+                except Exception:
+                    folder_name = None
+                if not folder_name:
+                    folder_name = self._get_folder_name_from_session_logs(session_id)
+                if not folder_name:
+                    folder_name = f"target_{session_id[:8]}"
                 
+                # Determine mount type
+                sess_type = session_info.get('type')
+                mount_type = 'ISCSI' if sess_type == 'PublishBackupContentViaMount' or session_info.get('mount_type') in ['DataIntegration', 'ISCSI'] else 'FLR'
+                
+                # Build correct UNC path, including admin share (e.g., \\\\server\\c$\\VeeamFLR\\folder)
+                unc_path = self._build_unc_path(session_id, folder_name)
+
                 # Store mount session info with correct UNC path
                 self.mount_sessions[session_id] = {
                     'backup_id': backup_id,
                     'restore_point_id': existing_session.get('restorePointId'),
-                    'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
+                    'mount_point': unc_path,
                     'folder_name': folder_name,
                     'mounted_at': datetime.utcnow(),
-                    'session_info': flr_session,
-                    'mount_type': 'FLR'
+                    'session_info': session_info,
+                    'mount_type': mount_type
                 }
                 
-                logger.info(f"Using existing FLR session {session_id} for backup {backup_id}")
+                logger.info(f"Using existing {mount_type} session {session_id} for backup {backup_id}")
                 return {
                     'session_id': session_id,
-                    'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
-                    'mount_type': 'FLR',
+                    'mount_point': unc_path,
+                    'mount_type': mount_type,
                     'status': 'mounted',
-                    'session_info': flr_session
+                    'session_info': session_info
                 }
             else:
                 # No existing session found, need to get restore points and create new one
@@ -290,35 +311,37 @@ class VeeamDataIntegrationAPI:
                 if not restore_point_id:
                     raise VeeamAPIError(f"No valid restore point ID found for backup {backup_id}")
                 
-                logger.info(f"Creating new FLR session for restore point {restore_point_id}")
+                logger.info(f"Creating new ISCSI Windows mount for restore point {restore_point_id}")
                 flr_session = self.create_flr_session_for_restore_point(restore_point_id)
                 
                 # The API returns 'sessionId' field, not 'id'
                 session_id = flr_session.get('sessionId') or flr_session.get('id')
                 
                 if session_id:
-                    # Construct the actual folder name used by Veeam
-                    # Format: {machineName}_{first8CharsOfSessionId}
-                    machine_name = flr_session.get('sourceProperties', {}).get('machineName', 'unknown')
-                    abbreviated_id = session_id[:8]
-                    folder_name = f"{machine_name}_{abbreviated_id}"
+                    # Resolve actual folder name (Data Integration details -> logs -> fallback)
+                    folder_name = self._get_folder_name_from_data_integration(session_id)
+                    if not folder_name:
+                        folder_name = self._get_folder_name_from_session_logs(session_id)
+                    if not folder_name:
+                        folder_name = f"target_{session_id[:8]}"
                     
-                    # Store mount session info with correct UNC path
+                    # Store mount session info with correct UNC path (with admin share)
+                    unc_path = self._build_unc_path(session_id, folder_name)
                     self.mount_sessions[session_id] = {
                         'backup_id': backup_id,
                         'restore_point_id': restore_point_id,
-                        'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
+                        'mount_point': unc_path,
                         'folder_name': folder_name,
                         'mounted_at': datetime.utcnow(),
                         'session_info': flr_session,
-                        'mount_type': 'FLR'
+                        'mount_type': 'ISCSI'
                     }
                     
-                    logger.info(f"Successfully created new FLR session {session_id} with folder {folder_name} for backup {backup_id}")
+                    logger.info(f"Successfully created new ISCSI session {session_id} with folder {folder_name} for backup {backup_id}")
                     return {
                         'session_id': session_id,
-                        'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
-                        'mount_type': 'FLR',
+                        'mount_point': unc_path,
+                        'mount_type': 'ISCSI',
                         'status': 'mounted',
                         'session_info': flr_session
                     }
@@ -804,7 +827,7 @@ class VeeamDataIntegrationAPI:
                 # Store FLR session info with correct UNC path
                 self.mount_sessions[session_id] = {
                     'backup_id': restore_point_id,
-                    'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
+                    'mount_point': f"\\\\{self.mount_server_name}\\VeeamFLR\\{folder_name}",
                     'folder_name': folder_name,
                     'mounted_at': datetime.utcnow(),
                     'session_info': flr_session,
@@ -886,6 +909,8 @@ class VeeamDataIntegrationAPI:
             success = False
             if mount_type == 'FLR':
                 success = self._try_unmount_flr(session_id)
+            elif mount_type == 'ISCSI':
+                success = self._try_unmount_data_integration(session_id)
             else:
                 success = self._try_unmount_data_integration(session_id)
             
@@ -972,8 +997,8 @@ class VeeamDataIntegrationAPI:
                     'creationTime': session.get('creationTime'),
                     'backupId': session.get('backupId'),
                     'restorePointId': session.get('restorePointId'),
-                    'mount_type': 'FLR',  # Sessions from FLR filter are FLR sessions
-                    'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{session.get('id')}",
+                    'mount_type': 'ISCSI',  # Use ISCSI for iSCSI Manual Mode  # Sessions from FLR filter are FLR sessions
+                    'mount_point': f"\\\\{self.mount_server_name}\\VeeamFLR\\{session.get('id')}",
                     'is_ready': False  # Will be determined below
                 }
                 all_sessions.append(session_info)
@@ -1099,9 +1124,9 @@ class VeeamDataIntegrationAPI:
             
             # Try different UNC path formats
             unc_paths = [
-                f"\\\\172.21.234.6\\VeeamFLR\\{session_id}",
-                f"//172.21.234.6/VeeamFLR/{session_id}",
-                f"\\\\172.21.234.6\\VeeamFLR\\target_*"  # Pattern match for target folders
+                f"\\\\{self.mount_server_name}\\VeeamFLR\\{session_id}",
+                f"//{self.mount_server_name}/VeeamFLR/{session_id}",
+                f"\\\\{self.mount_server_name}\\VeeamFLR\\target_*"  # Pattern match for target folders
             ]
             
             for unc_path in unc_paths:
@@ -1346,7 +1371,7 @@ class VeeamDataIntegrationAPI:
                 
                 # Create access methods for different scenarios
                 for i, target in enumerate(iscsi_info['iscsi_targets']):
-                    server_ip = server_ips[0] if server_ips else '172.21.234.6'
+                    server_ip = server_ips[0] if server_ips else '{self.mount_server_name}'
                     
                     # Method 1: Direct iSCSI access (requires iSCSI initiator)
                     iscsi_info['access_methods'].append({
@@ -1385,33 +1410,33 @@ class VeeamDataIntegrationAPI:
     
     def create_flr_session_for_restore_point(self, restore_point_id: str, credentials_id: str = None) -> Dict[str, Any]:
         """
-        Create a File Level Restore (FLR) session for a specific restore point.
-        This is an alternative to iSCSI mounts that provides direct file system access.
+        Create a File Level Restore session using iSCSI Manual Mode.
+        This method uses iSCSI Manual Mode instead of FLR API because it exposes the actual folder name in session logs.
         
         Args:
             restore_point_id: ID of the restore point to mount
             credentials_id: Optional credentials ID for authentication
             
         Returns:
-            Dictionary containing FLR session information
+            Dictionary containing session information with actual folder name
         """
         try:
-            # Prepare FLR request
-            flr_data = {
+            # Use configured mount server instead of extracting from base_url
+            # Use iSCSI Manual Mode instead of FLR API
+            # This exposes the actual folder name in session logs
+            iscsi_data = {
                 'restorePointId': restore_point_id,
-                'type': 'Windows',
-                'autoUnmount': {
-                    'isEnabled': True,
-                    'noActivityPeriodInMinutes': 60  # Longer timeout for ML processing
-                },
-                'reason': 'File Level Restore for ML data analysis'
+                'type': 'ISCSIWindowsMount',
+                'allowedIps': [self.mount_server_name],  # Use configured mount server
+                'targetServerName': self.mount_server_name,  # Use configured mount server
+                'targetServerCredentialsId': credentials_id or '00000000-0000-0000-0000-000000000000'
             }
             
-            # Add credentials if provided
-            if credentials_id:
-                flr_data['credentialsId'] = credentials_id
+            # Add mountHostId if configured
+            if self.mount_host_id:
+                iscsi_data['mountHostId'] = self.mount_host_id
             
-            url = f"{self.base_url}/api/v1/restore/flr"
+            url = f"{self.base_url}/api/v1/dataIntegration/publish"
             headers = {
                 'accept': 'application/json',
                 'x-api-version': '1.2-rev1',
@@ -1419,42 +1444,208 @@ class VeeamDataIntegrationAPI:
                 'Content-Type': 'application/json'
             }
             
-            logger.info(f"Creating FLR session for restore point {restore_point_id}")
-            response = self.session.post(url, json=flr_data, headers=headers, timeout=60)
+            logger.info(f"Creating iSCSI Manual Mode session for restore point {restore_point_id}")
+            response = self.session.post(url, json=iscsi_data, headers=headers, timeout=60)
             
-            if response.status_code == 201:
-                flr_session = response.json()
-                # The API returns 'sessionId' field, not 'id'
-                session_id = flr_session.get('sessionId') or flr_session.get('id')
+            if response.status_code in [200, 201]:  # Accept both 200 and 201
+                session_info = response.json()
+                session_id = session_info.get('id')
                 
                 if session_id:
-                    # Construct the actual folder name used by Veeam
-                    # Format: {machineName}_{first8CharsOfSessionId}
-                    machine_name = flr_session.get('sourceProperties', {}).get('machineName', 'unknown')
-                    abbreviated_id = session_id[:8]
-                    folder_name = f"{machine_name}_{abbreviated_id}"
+                    # Get the actual folder name from Data Integration API
+                    folder_name = self._get_folder_name_from_data_integration(session_id)
                     
-                    # Store FLR session info with correct UNC path
-                    self.mount_sessions[session_id] = {
-                        'backup_id': restore_point_id,
-                        'mount_point': f"\\\\172.21.234.6\\VeeamFLR\\{folder_name}",
-                        'folder_name': folder_name,
-                        'mounted_at': datetime.utcnow(),
-                        'session_info': flr_session,
-                        'mount_type': 'FLR'
-                    }
-                    logger.info(f"Successfully created FLR session {session_id} with folder {folder_name}")
+                    if folder_name:
+                        # Store session info with correct UNC path
+                        self.mount_sessions[session_id] = {
+                            'backup_id': restore_point_id,
+                            'mount_point': f"\\\\{self.mount_server_name}\\VeeamFLR\\{folder_name}",
+                            'folder_name': folder_name,
+                            'mounted_at': datetime.utcnow(),
+                            'session_info': session_info,
+                            'mount_type': 'ISCSI'  # Use ISCSI for iSCSI Manual Mode sessions
+                        }
+                        logger.info(f"Successfully created iSCSI Manual Mode session {session_id} with folder {folder_name}")
+                    else:
+                        # Fallback: use session ID as folder name
+                        fallback_folder_name = f"target_{session_id[:8]}"
+                        self.mount_sessions[session_id] = {
+                            'backup_id': restore_point_id,
+                            'mount_point': f"\\{self.mount_server_name}\\VeeamFLR\\{fallback_folder_name}",
+                            'folder_name': fallback_folder_name,
+                            'mounted_at': datetime.utcnow(),
+                            'session_info': session_info,
+                            'mount_type': 'ISCSI'  # Use ISCSI for iSCSI Manual Mode sessions
+                        }
+                        logger.warning(f"Could not determine folder name for session {session_id}, using fallback: {fallback_folder_name}")
                 
-                return flr_session
+                return session_info
             else:
-                error_msg = f"FLR creation failed with status {response.status_code}: {response.text}"
+                error_msg = f"iSCSI Manual Mode creation failed with status {response.status_code}: {response.text}"
                 logger.error(error_msg)
                 raise VeeamAPIError(error_msg)
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to create FLR session: {str(e)}")
-            raise VeeamAPIError(f"Failed to create FLR session: {str(e)}")
+            logger.error(f"Failed to create iSCSI Manual Mode session: {str(e)}")
+            raise VeeamAPIError(f"Failed to create iSCSI Manual Mode session: {str(e)}")
+    
+    def _get_folder_name_from_session_logs(self, session_id: str, max_wait_time: int = 120) -> str:
+        """
+        Get the actual folder name from session logs.
+        
+        Args:
+            session_id: Session ID to get logs for
+            max_wait_time: Maximum time to wait for session completion
+            
+        Returns:
+            Folder name if found, None otherwise
+        """
+        import time
+        
+        start_time = time.time()
+        while time.time() - start_time < max_wait_time:
+            try:
+                # Get session logs
+                logs_url = f"{self.base_url}/api/v1/sessions/{session_id}/logs"
+                headers = {
+                    'accept': 'application/json',
+                    'x-api-version': '1.2-rev1',
+                    'Authorization': f'Bearer {self.auth_token}'
+                }
+                
+                response = self.session.get(logs_url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    logs_data = response.json()
+                    records = logs_data.get('records', [])
+                    
+                    # Look for the folder name in log records
+                    for record in records:
+                        title = record.get('title', '')
+                        logger.debug(f"Checking log record: {title}")
+                        if 'VeeamFLR' in title and 'mounted to' in title:
+                            # Extract folder name from title like "Disks are mounted to {self.mount_server_name} in C:\\VeeamFLR\\target_e0b41da3"
+                            import re
+                            # Try multiple patterns
+                            patterns = [
+                                r'VeeamFLR\\([^\\s]+)',  # Match everything after VeeamFLR\ until whitespace
+                                r'VeeamFLR\\([^"]+)',   # Match everything after VeeamFLR\ until quote
+                                r'\\VeeamFLR\\([^\\s]+)'  # Match with escaped backslashes
+                            ]
+                            for pattern in patterns:
+                                match = re.search(pattern, title)
+                                if match:
+                                    folder_name = match.group(1)
+                                    logger.info(f"Found folder name {folder_name} in session logs using pattern: {pattern}")
+                                    return folder_name
+                            logger.warning(f"Could not extract folder name from log title: {title}")
+                
+                # Check if session is still working
+                session_url = f"{self.base_url}/api/v1/sessions/{session_id}"
+                session_response = self.session.get(session_url, headers=headers, timeout=30)
+                if session_response.status_code == 200:
+                    session_data = session_response.json()
+                    state = session_data.get('state')
+                    if state == 'Working':
+                        time.sleep(5)  # Wait 5 seconds before checking again
+                        continue
+                    elif state in ['Succeeded', 'Failed']:
+                        break
+                
+            except Exception as e:
+                logger.warning(f"Error getting session logs: {str(e)}")
+                time.sleep(5)
+        
+    def _get_folder_name_from_data_integration(self, session_id: str, max_wait_time: int = 120) -> str:
+        """
+        Get the actual folder name from Data Integration API.
+        
+        Args:
+            session_id: Session ID to get details for
+            max_wait_time: Maximum time to wait for session completion
+            
+        Returns:
+            Folder name if found, None otherwise
+        """
+        import time
+        import re
+        
+        start_time = time.time()
+        while time.time() - start_time < max_wait_time:
+            try:
+                # Get Data Integration session details
+                url = f"{self.base_url}/api/v1/dataIntegration/{session_id}"
+                headers = {
+                    'accept': 'application/json',
+                    'x-api-version': '1.2-rev0',
+                    'Authorization': f'Bearer {self.auth_token}'
+                }
+                
+                response = self.session.get(url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    session_data = response.json()
+                    
+                    # Extract folder name from mount points
+                    info = session_data.get('info', {})
+                    disks = info.get('disks', [])
+                    
+                    for disk in disks:
+                        mount_points = disk.get('mountPoints', [])
+                        for mount_point in mount_points:
+                            # Extract folder name from mount point like "C:\\VeeamFLR\\target_887e938b\\Volume0"
+                            match = re.search(r'VeeamFLR\\([^\\]+)', mount_point)
+                            if match:
+                                folder_name = match.group(1)
+                                logger.info(f"Found folder name {folder_name} in Data Integration API mount points")
+                                return folder_name
+                    
+                    # If no mount points found yet, check if session is still working
+                    mount_state = session_data.get('mountState')
+                    if mount_state == 'Mounted':
+                        logger.info(f"Session {session_id} is mounted but no mount points found yet")
+                        time.sleep(2)  # Wait 2 seconds before checking again
+                        continue
+                    elif mount_state in ['Failed', 'Unmounted']:
+                        logger.warning(f"Session {session_id} mount state is {mount_state}")
+                        break
+                    else:
+                        logger.info(f"Session {session_id} mount state is {mount_state}, waiting...")
+                        time.sleep(5)  # Wait 5 seconds before checking again
+                        continue
+                else:
+                    logger.warning(f"Data Integration API returned status {response.status_code} for session {session_id}")
+                    time.sleep(5)
+                    
+            except Exception as e:
+                logger.warning(f"Error getting Data Integration session details: {str(e)}")
+                time.sleep(5)
+        
+        logger.warning(f"Could not find folder name in Data Integration API for {session_id}")
+        return None
 
+    def _build_unc_path(self, session_id: str, folder_name: str) -> str:
+        """
+        Build the correct UNC path to the VeeamFLR folder using admin share.
+        We prefer the drive letter from mountPoints (e.g., C:) when available,
+        falling back to C$ if unknown.
+        """
+        try:
+            drive_letter = 'C'
+            details = self.get_mount_session_details(session_id)
+            info = details.get('info', {})
+            disks = info.get('disks', [])
+            for disk in disks:
+                mps = disk.get('mountPoints', [])
+                for mp in mps:
+                    # Example: C:\\VeeamFLR\\target_xxxxxxxx\\Volume0
+                    if len(mp) >= 2 and mp[1] == ':':
+                        drive_letter = mp[0]
+                        raise StopIteration
+        except StopIteration:
+            pass
+        except Exception:
+            pass
+        # Construct UNC with admin share
+        return f"\\\\{self.mount_server_name}\\{drive_letter}$\\VeeamFLR\\{folder_name}"
 
 
 class LocalFileSystemMounter:
@@ -1493,15 +1684,15 @@ class LocalFileSystemMounter:
             mount_point = os.path.join(self.base_path, str(uuid.uuid4()))
         
         # Create mount point directory
-            os.makedirs(mount_point, exist_ok=True)
+        os.makedirs(mount_point, exist_ok=True)
             
         # Store mount session info
         session_id = str(uuid.uuid4())
         self.mount_sessions[session_id] = {
-                'backup_file': backup_file_path,
-                'mount_point': mount_point,
-                'mounted_at': datetime.utcnow()
-            }
+            'backup_file': backup_file_path,
+            'mount_point': mount_point,
+            'mounted_at': datetime.utcnow()
+        }
             
         logger.info(f"Mounted backup file {backup_file_path} to {mount_point}")
         return mount_point
