@@ -35,6 +35,9 @@ export const BackupManager = () => {
   const [selectedBackup, setSelectedBackup] = useState(null)
   const [scanResults, setScanResults] = useState(null)
   const [isScanning, setIsScanning] = useState(false)
+  const [mountingBackupId, setMountingBackupId] = useState(null)
+  const [unmountingBackupId, setUnmountingBackupId] = useState(null)
+  const [isReconciling, setIsReconciling] = useState(false)
 
   const { getBackups, mountBackup, unmountBackup, scanBackupFiles } = useVeeamAPI()
   const { toast } = useToast()
@@ -70,6 +73,7 @@ export const BackupManager = () => {
 
   const handleMount = async (backup) => {
     try {
+      setMountingBackupId(backup.id)
       await mountBackup(backup.id)
       toast({
         title: "Backup mounted",
@@ -82,11 +86,14 @@ export const BackupManager = () => {
         description: error.message,
         variant: "destructive",
       })
+    } finally {
+      setMountingBackupId(null)
     }
   }
 
   const handleUnmount = async (backup) => {
     try {
+      setUnmountingBackupId(backup.id)
       await unmountBackup(backup.id)
       toast({
         title: "Backup unmounted",
@@ -99,6 +106,8 @@ export const BackupManager = () => {
         description: error.message,
         variant: "destructive",
       })
+    } finally {
+      setUnmountingBackupId(null)
     }
   }
 
@@ -116,6 +125,40 @@ export const BackupManager = () => {
       })
     } finally {
       setIsScanning(false)
+    }
+  }
+
+  const handleReconcileState = async () => {
+    try {
+      setIsReconciling(true)
+      const response = await fetch('/api/veeam/reconcile-state', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
+      
+      if (!response.ok) {
+        throw new Error('Reconciliation failed')
+      }
+      
+      const result = await response.json()
+      
+      toast({
+        title: "State reconciled",
+        description: result.message,
+      })
+      
+      // Refresh the backups list to show updated states
+      loadBackups()
+    } catch (error) {
+      toast({
+        title: "Reconciliation failed",
+        description: error.message,
+        variant: "destructive",
+      })
+    } finally {
+      setIsReconciling(false)
     }
   }
 
@@ -170,10 +213,30 @@ export const BackupManager = () => {
           <h2 className="text-3xl font-bold text-gray-900">Backup Manager</h2>
           <p className="text-gray-500">Manage and explore your Veeam backups</p>
         </div>
-        <Button onClick={loadBackups} variant="outline">
-          <RefreshCw className="h-4 w-4 mr-2" />
-          Refresh
-        </Button>
+        <div className="flex space-x-2">
+          <Button onClick={loadBackups} variant="outline">
+            <RefreshCw className="h-4 w-4 mr-2" />
+            Refresh
+          </Button>
+          <Button 
+            onClick={handleReconcileState} 
+            variant="outline"
+            disabled={isReconciling}
+            className="flex items-center"
+          >
+            {isReconciling ? (
+              <>
+                <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
+                Reconciling...
+              </>
+            ) : (
+              <>
+                <Activity className="h-4 w-4 mr-2" />
+                Sync State
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {/* Search and Filters */}
@@ -240,9 +303,19 @@ export const BackupManager = () => {
                           size="sm"
                           onClick={() => handleMount(backup)}
                           className="flex items-center"
+                          disabled={mountingBackupId === backup.id}
                         >
-                          <HardDriveUpload className="h-4 w-4 mr-1" />
-                          Mount
+                          {mountingBackupId === backup.id ? (
+                            <>
+                              <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
+                              Mounting...
+                            </>
+                          ) : (
+                            <>
+                              <HardDriveUpload className="h-4 w-4 mr-1" />
+                              Mount
+                            </>
+                          )}
                         </Button>
                       ) : backup.status === 'mounted' ? (
                         <>
@@ -330,9 +403,19 @@ export const BackupManager = () => {
                             variant="outline"
                             onClick={() => handleUnmount(backup)}
                             className="flex items-center"
+                            disabled={unmountingBackupId === backup.id}
                           >
-                            <HardDriveDownload className="h-4 w-4 mr-1" />
-                            Unmount
+                            {unmountingBackupId === backup.id ? (
+                              <>
+                                <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
+                                Unmounting...
+                              </>
+                            ) : (
+                              <>
+                                <HardDriveDownload className="h-4 w-4 mr-1" />
+                                Unmount
+                              </>
+                            )}
                           </Button>
                         </>
                       ) : null}

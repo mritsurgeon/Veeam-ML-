@@ -1,8 +1,9 @@
 from flask import Blueprint, request, jsonify
 from src.models.veeam_backup import db, VeeamBackup, MLJob, DataExtraction
-from src.services.veeam_api import VeeamDataIntegrationAPI, VeeamAPIError
+from src.services.unc_file_scanner import scan_unc_path
 from src.services.data_extractor import DataExtractionService, DataExtractionError
 from src.services.ml_processor import MLProcessingService, MLProcessingError
+from src.services.veeam_api import VeeamDataIntegrationAPI, VeeamAPIError
 import logging
 import json
 import os
@@ -245,46 +246,23 @@ def mount_backup(backup_id):
         if backup.status == 'mounted':
             return jsonify({'error': 'Backup is already mounted'}), 400
         
-        # Mount backup using OS-specific method with fallback
-        mount_session = None
-        mount_type = None
+        # Mount backup using FLR API for direct UNC path access
+        mount_session = veeam_api.mount_backup(backup.backup_id)
+        session_id = mount_session.get('session_id')
+        mount_type = mount_session.get('mount_type', 'FLR')
         
-        if backup.os_type == 'windows':
-            # Try FLR first for Windows backups
-            try:
-                mount_session = veeam_api.mount_windows_backup_flr(backup.backup_id)
-                mount_type = 'FLR'
-                logger.info(f"Successfully mounted Windows backup using FLR")
-            except VeeamAPIError as e:
-                logger.warning(f"FLR mount failed, trying Data Integration API: {str(e)}")
-                try:
-                    # Fallback to Data Integration API
-                    mount_session = veeam_api.mount_backup(backup.backup_id, None)
-                    mount_type = 'DataIntegration'
-                    logger.info(f"Successfully mounted Windows backup using Data Integration API")
-                except VeeamAPIError as e2:
-                    logger.error(f"Both FLR and Data Integration mount failed: {str(e2)}")
-                    raise e2
-        else:
-            # Use Data Integration API for Linux/other
-            mount_session = veeam_api.mount_backup(backup.backup_id, None)
-            mount_type = 'DataIntegration'
+        if not session_id:
+            return jsonify({'error': 'Failed to create mount session'}), 500
         
-        # Get the session ID from the mount response
-        session_id = mount_session.get('id') if mount_session else None
-        
-        # Store the session ID as the mount point (this is the real identifier)
-        mount_point = session_id if session_id else f"/tmp/veeam_mounts/{backup.backup_id}"
-        
-        # Update backup status
-        backup.mount_point = mount_point
+        # Update backup status with actual UNC path
+        backup.mount_point = mount_session.get('mount_point', session_id)
         backup.status = 'mounted'
         backup.updated_at = datetime.utcnow()
         db.session.commit()
         
         return jsonify({
             'message': 'Backup mounted successfully',
-            'mount_point': mount_point,
+            'mount_point': mount_session.get('mount_point'),
             'mount_type': mount_type,
             'os_type': backup.os_type,
             'session_info': mount_session,
@@ -345,24 +323,53 @@ def unmount_backup(backup_id):
                 break
         
         if session_id:
-            # Unmount backup using Veeam API
-            success = veeam_api.unmount_backup(session_id)
-            
-            if success:
-                # Update backup status
-                backup.mount_point = None
-                backup.status = 'available'
-                backup.updated_at = datetime.utcnow()
-                db.session.commit()
+            try:
+                # Unmount backup using Veeam API
+                success = veeam_api.unmount_backup(session_id)
                 
-                return jsonify({
-                    'message': 'Backup unmounted successfully',
-                    'backup': backup.to_dict()
-                })
-            else:
-                return jsonify({'error': 'Failed to unmount backup'}), 500
+                if success:
+                    # Update backup status
+                    backup.mount_point = None
+                    backup.status = 'available'
+                    backup.updated_at = datetime.utcnow()
+                    db.session.commit()
+                    
+                    return jsonify({
+                        'message': 'Backup unmounted successfully',
+                        'backup': backup.to_dict()
+                    })
+                else:
+                    return jsonify({'error': 'Failed to unmount backup'}), 500
+            except VeeamAPIError as e:
+                # Check if the error indicates the session doesn't exist
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in ['not found', 'session not found', 'does not exist', 'invalid session']):
+                    # Session doesn't exist in Veeam - assume it's already unmounted
+                    logger.warning(f"Session {session_id} not found in Veeam, assuming already unmounted")
+                    backup.mount_point = None
+                    backup.status = 'available'
+                    backup.updated_at = datetime.utcnow()
+                    db.session.commit()
+                    
+                    return jsonify({
+                        'message': 'Backup was already unmounted in Veeam - state synchronized',
+                        'backup': backup.to_dict()
+                    })
+                else:
+                    # Re-raise other VeeamAPIError exceptions
+                    raise e
         else:
-            return jsonify({'error': 'Mount session not found'}), 404
+            # No session found locally - assume it's already unmounted
+            logger.warning(f"No mount session found for backup {backup_id}, assuming already unmounted")
+            backup.mount_point = None
+            backup.status = 'available'
+            backup.updated_at = datetime.utcnow()
+            db.session.commit()
+            
+            return jsonify({
+                'message': 'Backup was already unmounted - state synchronized',
+                'backup': backup.to_dict()
+            })
             
     except VeeamAPIError as e:
         logger.error(f"Failed to unmount backup: {str(e)}")
@@ -395,164 +402,67 @@ def scan_backup_files(backup_id):
         if not session_id:
             return jsonify({'error': 'Backup is not mounted'}), 400
         
-        # Determine mount type based on OS and session ID format
-        mount_info = {
-            'backup_id': backup.backup_id,
-            'mount_type': 'FLR' if backup.os_type == 'windows' else 'DataIntegration',
-            'mount_point': session_id
-        }
+        # Get mount session info to determine mount type
+        mount_session_info = None
+        for sid, session_info in veeam_api.mount_sessions.items():
+            if sid == session_id:
+                mount_session_info = session_info
+                break
         
-        # Handle different mount types based on OS and mount method
-        if backup.os_type == 'windows' and mount_info.get('mount_type') == 'FLR':
-            # Windows FLR - access C:\VeeamFLR\target_* directories
+        mount_type = mount_session_info.get('mount_type', 'FLR') if mount_session_info else 'FLR'
+        
+        # Handle FLR mounts with UNC path access
+        if mount_type == 'FLR':
+            # FLR mounts provide direct UNC path access
+            unc_path = mount_session_info.get('mount_point') if mount_session_info else f"\\\\172.21.234.6\\VeeamFLR\\{session_id}"
+            
             try:
-                mount_points = veeam_api.get_flr_mount_points(session_id)
-                server_ip = '172.21.234.6'  # Veeam server IP
+                logger.info(f"Scanning UNC path: {unc_path}")
+                scanned_files = scan_unc_path(
+                    unc_path, 
+                    username='Administrator', 
+                    password='Veeam123',
+                    max_depth=2  # Limit depth to avoid scanning too much
+                )
                 
-                # Convert Windows paths to UNC paths for actual file access
-                unc_paths = []
-                extractable_files = []
+                # Filter for extractable files only
+                extractable_files = [
+                    file for file in scanned_files 
+                    if file.get('extractable', False)
+                ]
                 
-                for mount_point in mount_points:
-                    # Convert C:\VeeamFLR\... to UNC path
-                    if mount_point.startswith('C:\\'):
-                        unc_path = f"\\\\{server_ip}\\C$\\{mount_point[3:]}"
-                    else:
-                        unc_path = f"\\\\{server_ip}\\{mount_point.replace('/', '\\')}"
-                    
-                    unc_paths.append(unc_path)
-                    
-                    # TODO: Implement actual file enumeration from UNC paths
-                    # For now, return the UNC path for manual verification
-                    # This would require Windows SMB client or similar to access UNC paths
-                    extractable_files.append({
-                        'name': 'UNC_PATH_AVAILABLE',
-                        'path': unc_path,
-                        'size': 0,
-                        'extractable': True,
-                        'file_type': 'unc_path',
-                        'note': 'UNC path available for file enumeration - requires SMB client implementation'
-                    })
+                logger.info(f"Found {len(scanned_files)} total files, {len(extractable_files)} extractable")
                 
                 return jsonify({
                     'backup_id': backup_id,
                     'mount_point': backup.mount_point,
-                    'actual_mount_points': mount_points,
-                    'unc_paths': unc_paths,
+                    'unc_path': unc_path,
                     'mount_type': 'FLR',
                     'os_type': backup.os_type,
                     'session_id': session_id,
                     'scanned_directory': directory_path,
                     'extractable_files': extractable_files,
-                    'total_files': len(extractable_files),
+                    'total_files': len(scanned_files),
                     'extractable_count': len(extractable_files),
-                    'message': f'FLR mounted to {mount_points[0] if mount_points else "C:\\VeeamFLR"} - accessible via UNC paths'
+                    'message': f'FLR mounted - accessible via UNC path: {unc_path}'
                 })
                 
-            except VeeamAPIError as e:
-                return jsonify({'error': f'Failed to get FLR mount points: {str(e)}'}), 400
+            except Exception as e:
+                logger.error(f"Failed to scan UNC path {unc_path}: {str(e)}")
+                return jsonify({'error': f'Scanning failed: {str(e)}'}), 500
         
-        elif mount_info.get('mount_type') == 'DataIntegration':
-            # Data Integration API - handle iSCSI targets
-            try:
-                session_details = veeam_api.get_mount_session_details(session_id)
-            except VeeamAPIError as e:
-                return jsonify({'error': f'Failed to get mount session details: {str(e)}'}), 400
-        
-        else:
-            # Unknown mount type - return error
-            return jsonify({'error': f'Unknown mount type: {mount_info.get("mount_type", "unknown")}'}), 400
-        
-        # Extract actual mount points from the session details using the correct schema
-        # Schema: info.disks[].mountPoints and info.serverIps
-        mount_points = []
-        extractable_files = []
-        server_ips = []
-        mount_mode = 'Unknown'
-        
-        # Get mount mode and server IPs
-        if 'info' in session_details:
-            mount_mode = session_details['info'].get('mode', 'Unknown')
-            server_ips = session_details['info'].get('serverIps', [])
-        
-        # Default to Veeam server IP if no server IPs found
-        if not server_ips:
-            server_ips = ['172.21.234.6']
-        
-        # Extract mount points from disks
-        if 'info' in session_details and 'disks' in session_details['info']:
-            for disk in session_details['info']['disks']:
-                disk_id = disk.get('diskId', 'unknown')
-                disk_name = disk.get('diskName', 'unknown')
-                disk_mount_points = disk.get('mountPoints', [])
-                access_link = disk.get('accessLink', '')
-                
-                mount_points.extend(disk_mount_points)
-                
-                # Handle different mount modes
-                if mount_mode == 'ISCSI' and not disk_mount_points:
-                    # ISCSI mode with no mount points - this is a raw disk target
-                    # Use the access link (IQN) as the identifier
-                    server_ip = server_ips[0] if server_ips else '172.21.234.6'
-                    
-                    # For ISCSI targets without mount points, we can't directly access files
-                    # This would require mounting the iSCSI target first
-                    sample_files = [
-                        {'name': 'iSCSI_Target', 'path': f'ISCSI Target: {access_link}', 'size': 0, 'extractable': False, 'file_type': 'iscsi_target'},
-                        {'name': 'Disk_ID', 'path': f'Disk ID: {disk_id}', 'size': 0, 'extractable': False, 'file_type': 'disk_info'},
-                        {'name': 'Server_IP', 'path': f'Target Server: {server_ip}', 'size': 0, 'extractable': False, 'file_type': 'server_info'}
-                    ]
-                    extractable_files.extend(sample_files)
-                    
-                elif disk_mount_points:
-                    # Has actual mount points - can scan files
-                    for mount_point in disk_mount_points:
-                        # Use the first server IP for UNC path construction
-                        server_ip = server_ips[0] if server_ips else '172.21.234.6'
-                        
-                        # Handle different mount modes
-                        if mount_mode == 'Fuse':
-                            # Fuse mode: Linux paths, convert to UNC
-                            unc_path = f"\\\\{server_ip}\\{mount_point.replace('/', '\\')}"
-                        elif mount_mode == 'ISCSI':
-                            # ISCSI mode: Windows paths, already UNC-like
-                            if mount_point.startswith('C:\\'):
-                                unc_path = f"\\\\{server_ip}\\{mount_point.replace('C:', 'C$')}"
-                            else:
-                                unc_path = f"\\\\{server_ip}\\{mount_point.replace('/', '\\')}"
-                        else:
-                            # Fallback: assume Linux path
-                            unc_path = f"\\\\{server_ip}\\{mount_point.replace('/', '\\')}"
-                        
-                        # Simulate files found in this mount point
-                        sample_files = [
-                            {'name': 'system.log', 'path': f'{unc_path}\\system.log', 'size': 2048, 'extractable': True, 'file_type': 'log'},
-                            {'name': 'config.ini', 'path': f'{unc_path}\\config.ini', 'size': 512, 'extractable': True, 'file_type': 'config'},
-                            {'name': 'data.csv', 'path': f'{unc_path}\\data.csv', 'size': 4096, 'extractable': True, 'file_type': 'data'},
-                            {'name': 'database.db', 'path': f'{unc_path}\\database.db', 'size': 8192, 'extractable': True, 'file_type': 'database'}
-                        ]
-                        extractable_files.extend(sample_files)
-        
-        if not mount_points:
-            # Fallback if no mount points found
-            mount_points = ['/tmp/veeam_mount']
-            server_ip = server_ips[0] if server_ips else '172.21.234.6'
-            extractable_files = [
-                {'name': 'backup_data.bin', 'path': f'\\\\{server_ip}\\tmp\\veeam_mount\\backup_data.bin', 'size': 1024, 'extractable': True, 'file_type': 'data'}
-            ]
-        
+        # Fallback for Data Integration mounts (if any)
         return jsonify({
             'backup_id': backup_id,
             'mount_point': backup.mount_point,
-            'actual_mount_points': mount_points,
-            'server_ips': server_ips,
-            'mount_mode': mount_mode,
+            'mount_type': mount_type,
+            'os_type': backup.os_type,
             'session_id': session_id,
             'scanned_directory': directory_path,
-            'extractable_files': extractable_files,
-            'total_files': len(extractable_files),
-            'extractable_count': len(extractable_files),
-            'session_details': session_details
+            'extractable_files': [],
+            'total_files': 0,
+            'extractable_count': 0,
+            'message': f'Mount type {mount_type} - scanning not implemented for this type'
         })
         
     except VeeamAPIError as e:
@@ -767,6 +677,46 @@ def delete_ml_job(job_id):
         
     except Exception as e:
         logger.error(f"Failed to delete ML job: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@veeam_bp.route('/reconcile-state', methods=['POST'])
+def reconcile_mount_state():
+    """Reconcile local mount state with actual Veeam server state."""
+    global veeam_api
+    
+    if veeam_api is None:
+        return jsonify({'error': 'Veeam API not configured'}), 400
+    
+    try:
+        # Reconcile mount state
+        reconciliation_result = veeam_api.reconcile_mount_state()
+        
+        # Update database backup statuses based on reconciled state
+        for session_id, session_info in veeam_api.mount_sessions.items():
+            # Find backup in database by backup_id
+            backup = VeeamBackup.query.filter_by(backup_id=session_info['backup_id']).first()
+            if backup:
+                if session_info['state'] == 'Working':
+                    backup.status = 'mounted'
+                    backup.mount_point = session_info.get('mount_point', session_id)
+                else:
+                    backup.status = 'available'
+                    backup.mount_point = None
+                backup.updated_at = datetime.utcnow()
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Mount state reconciled successfully',
+            'reconciliation_result': reconciliation_result,
+            'active_sessions': len(veeam_api.mount_sessions)
+        })
+        
+    except VeeamAPIError as e:
+        logger.error(f"Veeam API error during reconciliation: {str(e)}")
+        return jsonify({'error': f'Reconciliation failed: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Failed to reconcile mount state: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @veeam_bp.route('/health', methods=['GET'])

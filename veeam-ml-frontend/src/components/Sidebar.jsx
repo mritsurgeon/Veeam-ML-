@@ -6,7 +6,8 @@ import {
   Settings, 
   Menu,
   ChevronLeft,
-  Activity
+  Activity,
+  FileText
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
@@ -15,6 +16,7 @@ const navigation = [
   { name: 'Dashboard', href: '/dashboard', icon: BarChart3 },
   { name: 'Backups', href: '/backups', icon: Database },
   { name: 'ML Jobs', href: '/ml-jobs', icon: Brain },
+  { name: 'Extraction Jobs', href: '/extraction-jobs', icon: FileText },
   { name: 'Configuration', href: '/configuration', icon: Settings },
 ]
 

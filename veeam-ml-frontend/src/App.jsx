@@ -6,6 +6,7 @@ import { Dashboard } from '@/components/Dashboard'
 import { BackupManager } from '@/components/BackupManager'
 import { MLJobManager } from '@/components/MLJobManager'
 import { ConfigurationPanel } from '@/components/ConfigurationPanel'
+import ExtractionJobManager from '@/components/ExtractionJobManager'
 import { VeeamAPIProvider } from '@/hooks/useVeeamAPI'
 import './App.css'
 
@@ -38,6 +39,7 @@ function App() {
                 <Route path="/dashboard" element={<Dashboard />} />
                 <Route path="/backups" element={<BackupManager />} />
                 <Route path="/ml-jobs" element={<MLJobManager />} />
+                <Route path="/extraction-jobs" element={<ExtractionJobManager />} />
                 <Route path="/configuration" element={<ConfigurationPanel />} />
               </Routes>
             </main>
